@@ -20,13 +20,13 @@ from torch.autograd.function import once_differentiable
 
 try:
     import MultiScaleDeformableAttention as MSDA
+    MSDA_AVAILABLE = True
 except ModuleNotFoundError as e:
-    info_string = (
-        "\n\nPlease compile MultiScaleDeformableAttention CUDA op with the following commands:\n"
-        "\t`cd mask2former/modeling/pixel_decoder/ops`\n"
-        "\t`sh make.sh`\n"
-    )
-    raise ModuleNotFoundError(info_string)
+    # CPU fallback will be used
+    MSDA_AVAILABLE = False
+    MSDA = None
+    import warnings
+    warnings.warn("MultiScaleDeformableAttention CUDA op not available. Using CPU fallback (slower).")
 
 
 class MSDeformAttnFunction(Function):

@@ -48,10 +48,9 @@ def get_extensions():
             "-D__CUDA_NO_HALF2_OPERATORS__",
         ]
     else:
-        if CUDA_HOME is None:
-            raise NotImplementedError('CUDA_HOME is None. Please set environment variable CUDA_HOME.')
-        else:
-            raise NotImplementedError('No CUDA runtime is found. Please set FORCE_CUDA=1 or test it by running torch.cuda.is_available().')
+        # CPU-only build when CUDA is not available
+        print("CUDA not available. Building CPU-only version.")
+        print("The module will be built, but will fall back to PyTorch implementation at runtime.")
 
     sources = [os.path.join(extensions_dir, s) for s in sources]
     include_dirs = [extensions_dir]

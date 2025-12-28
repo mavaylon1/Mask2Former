@@ -67,12 +67,13 @@ class Trainer(DefaultTrainer):
     @classmethod
     def inference_and_save_logits(cls, cfg, model, output_dir):
         """
-        Run inference on all samples and save logits to disk.
+        Run inference on ONE sample and save logits to HDF5.
         """
         import os
         import torch
+        import h5py
+        import numpy as np
         from detectron2.data import build_detection_test_loader
-        from tqdm import tqdm
 
         print(f"Running inference and saving logits to: {output_dir}")
 
@@ -84,52 +85,46 @@ class Trainer(DefaultTrainer):
         data_loader = build_detection_test_loader(cfg, dataset_name)
 
         print(f"Dataset: {dataset_name}")
-        print(f"Total samples: {len(data_loader.dataset)}")
-
-        saved_count = 0
 
         with torch.no_grad():
-            for idx, inputs in enumerate(tqdm(data_loader, desc="Processing images")):
-                # Run inference
-                outputs = model(inputs)
+            # Get just the first batch
+            inputs = next(iter(data_loader))
 
-                # Process each sample in the batch
-                for i, (inp, output) in enumerate(zip(inputs, outputs)):
-                    # Get the logits tensor
-                    logits = output['sem_seg']  # Shape: [num_classes, H, W]
+            # Run inference
+            outputs = model(inputs)
 
-                    # Extract filename and create output path
-                    img_filename = os.path.basename(inp['file_name'])
-                    img_name = os.path.splitext(img_filename)[0]
-                    output_path = os.path.join(output_dir, f"{img_name}_logits.pt")
+            # Process first sample
+            inp = inputs[0]
+            output = outputs[0]
 
-                    # Save logits to disk
-                    torch.save({
-                        'logits': logits.cpu(),
-                        'file_name': inp['file_name'],
-                        'height': inp['height'],
-                        'width': inp['width'],
-                    }, output_path)
+            # Get the logits tensor
+            logits = output['sem_seg'].cpu().numpy()  # Shape: [num_classes, H, W]
 
-                    saved_count += 1
+            # Extract filename and create output path
+            img_filename = os.path.basename(inp['file_name'])
+            img_name = os.path.splitext(img_filename)[0]
+            output_path = os.path.join(output_dir, f"{img_name}_logits.h5")
 
-                    # Print info for first sample
-                    if saved_count == 1:
-                        print(f"\n{'=' * 60}")
-                        print("FIRST SAMPLE INFO:")
-                        print(f"File: {inp['file_name']}")
-                        print(f"Image shape: {inp['image'].shape}")
-                        print(f"Logits shape: {logits.shape}")
-                        print(f"Logits dtype: {logits.dtype}")
-                        print(f"Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
-                        print(f"Saved to: {output_path}")
-                        print(f"{'=' * 60}\n")
+            # Save to HDF5
+            with h5py.File(output_path, 'w') as f:
+                f.create_dataset('logits', data=logits, compression='gzip', compression_opts=4)
+                f.attrs['file_name'] = inp['file_name']
+                f.attrs['height'] = inp['height']
+                f.attrs['width'] = inp['width']
+                f.attrs['num_classes'] = logits.shape[0]
 
-        print(f"\n{'=' * 60}")
-        print(f"DONE! Saved {saved_count} logit files to: {output_dir}")
-        print(f"{'=' * 60}\n")
+            print(f"\n{'=' * 60}")
+            print("INFERENCE COMPLETE:")
+            print(f"File: {inp['file_name']}")
+            print(f"Image shape: {inp['image'].shape}")
+            print(f"Logits shape: {logits.shape}")
+            print(f"Logits dtype: {logits.dtype}")
+            print(f"Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+            print(f"Saved to: {output_path}")
+            print(f"File size: {os.path.getsize(output_path) / (1024**2):.2f} MB")
+            print(f"{'=' * 60}\n")
 
-        return {"saved_count": saved_count, "output_dir": output_dir}
+            return {"output_path": output_path, "logits_shape": logits.shape}
 
 
     @classmethod

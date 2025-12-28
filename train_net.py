@@ -117,7 +117,7 @@ class Trainer(DefaultTrainer):
             )[0]
 
             # Resize to original image dimensions
-            from mask2former.utils.misc import sem_seg_postprocess
+            from detectron2.modeling.postprocessing import sem_seg_postprocess
             height = inp.get("height", images.image_sizes[0][0])
             width = inp.get("width", images.image_sizes[0][1])
             mask_pred_result = sem_seg_postprocess(

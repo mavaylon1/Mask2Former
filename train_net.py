@@ -89,42 +89,76 @@ class Trainer(DefaultTrainer):
         with torch.no_grad():
             # Get just the first batch
             inputs = next(iter(data_loader))
-
-            # Run inference
-            outputs = model(inputs)
-
-            # Process first sample
             inp = inputs[0]
-            output = outputs[0]
 
-            # Get the logits tensor
-            logits = output['sem_seg'].cpu().numpy()  # Shape: [num_classes, H, W]
+            # Get raw logits by running model's backbone and head directly
+            # This bypasses semantic_inference which applies softmax/sigmoid
+            from detectron2.structures import ImageList
+            import torch.nn.functional as F
+
+            images = [x["image"].to(model.device) for x in inputs]
+            images = [(x - model.pixel_mean) / model.pixel_std for x in images]
+            images = ImageList.from_tensors(images, model.size_divisibility)
+
+            # Get features and raw outputs
+            features = model.backbone(images.tensor)
+            outputs = model.sem_seg_head(features)
+
+            # Extract RAW logits (before softmax/sigmoid)
+            mask_cls_result = outputs["pred_logits"][0]  # Shape: [num_queries, num_classes+1]
+            mask_pred_result = outputs["pred_masks"][0]  # Shape: [num_queries, H, W]
+
+            # Upsample masks to match image size
+            mask_pred_result = F.interpolate(
+                mask_pred_result.unsqueeze(0),
+                size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+
+            # Resize to original image dimensions
+            from mask2former.utils.misc import sem_seg_postprocess
+            height = inp.get("height", images.image_sizes[0][0])
+            width = inp.get("width", images.image_sizes[0][1])
+            mask_pred_result = sem_seg_postprocess(
+                mask_pred_result, images.image_sizes[0], height, width
+            )
+            mask_cls_result = mask_cls_result.to(mask_pred_result)
+
+            # Convert to numpy
+            mask_cls_logits = mask_cls_result.cpu().numpy()  # [num_queries, num_classes+1]
+            mask_pred_logits = mask_pred_result.cpu().numpy()  # [num_queries, H, W]
 
             # Extract filename and create output path
             img_filename = os.path.basename(inp['file_name'])
             img_name = os.path.splitext(img_filename)[0]
             output_path = os.path.join(output_dir, f"{img_name}_logits.h5")
 
-            # Save to HDF5
+            # Save RAW logits to HDF5
             with h5py.File(output_path, 'w') as f:
-                f.create_dataset('logits', data=logits, compression='gzip', compression_opts=4)
+                f.create_dataset('mask_cls_logits', data=mask_cls_logits, compression='gzip', compression_opts=4)
+                f.create_dataset('mask_pred_logits', data=mask_pred_logits, compression='gzip', compression_opts=4)
                 f.attrs['file_name'] = inp['file_name']
-                f.attrs['height'] = inp['height']
-                f.attrs['width'] = inp['width']
-                f.attrs['num_classes'] = logits.shape[0]
+                f.attrs['height'] = height
+                f.attrs['width'] = width
+                f.attrs['num_queries'] = mask_cls_logits.shape[0]
+                f.attrs['num_classes'] = mask_cls_logits.shape[1] - 1  # Exclude void class
 
             print(f"\n{'=' * 60}")
-            print("INFERENCE COMPLETE:")
+            print("INFERENCE COMPLETE - RAW LOGITS SAVED:")
             print(f"File: {inp['file_name']}")
             print(f"Image shape: {inp['image'].shape}")
-            print(f"Logits shape: {logits.shape}")
-            print(f"Logits dtype: {logits.dtype}")
-            print(f"Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+            print(f"mask_cls_logits shape: {mask_cls_logits.shape}")
+            print(f"mask_pred_logits shape: {mask_pred_logits.shape}")
+            print(f"mask_cls_logits range: [{mask_cls_logits.min():.4f}, {mask_cls_logits.max():.4f}]")
+            print(f"mask_pred_logits range: [{mask_pred_logits.min():.4f}, {mask_pred_logits.max():.4f}]")
             print(f"Saved to: {output_path}")
             print(f"File size: {os.path.getsize(output_path) / (1024**2):.2f} MB")
+            print(f"\nNOTE: These are RAW logits (before softmax/sigmoid)")
+            print(f"Use these for distillation loss computation")
             print(f"{'=' * 60}\n")
 
-            return {"output_path": output_path, "logits_shape": logits.shape}
+            return {"output_path": output_path, "mask_cls_shape": mask_cls_logits.shape, "mask_pred_shape": mask_pred_logits.shape}
 
 
     @classmethod

@@ -67,14 +67,14 @@ class Trainer(DefaultTrainer):
     @classmethod
     def inference_and_save_logits(cls, cfg, model, output_dir):
         """
-        Run inference on ONE sample to inspect output structure.
+        Run inference on all samples and save logits to disk.
         """
         import os
         import torch
         from detectron2.data import build_detection_test_loader
+        from tqdm import tqdm
 
-        logger = logging.getLogger(__name__)
-        logger.info("Running inference on ONE sample to inspect output...")
+        print(f"Running inference and saving logits to: {output_dir}")
 
         os.makedirs(output_dir, exist_ok=True)
         model.eval()
@@ -83,52 +83,53 @@ class Trainer(DefaultTrainer):
         dataset_name = cfg.DATASETS.TEST[0]
         data_loader = build_detection_test_loader(cfg, dataset_name)
 
-        logger.info(f"Dataset: {dataset_name}")
+        print(f"Dataset: {dataset_name}")
+        print(f"Total samples: {len(data_loader.dataset)}")
+
+        saved_count = 0
 
         with torch.no_grad():
-            # Get just the first batch
-            inputs = next(iter(data_loader))
+            for idx, inputs in enumerate(tqdm(data_loader, desc="Processing images")):
+                # Run inference
+                outputs = model(inputs)
 
-            logger.info(f"\n{'=' * 60}")
-            logger.info("INPUT STRUCTURE:")
-            logger.info(f"Number of samples in batch: {len(inputs)}")
-            logger.info(f"First input keys: {inputs[0].keys()}")
-            logger.info(f"Image shape: {inputs[0]['image'].shape}")
-            logger.info(f"File name: {inputs[0]['file_name']}")
+                # Process each sample in the batch
+                for i, (inp, output) in enumerate(zip(inputs, outputs)):
+                    # Get the logits tensor
+                    logits = output['sem_seg']  # Shape: [num_classes, H, W]
 
-            # Run inference
-            outputs = model(inputs)
+                    # Extract filename and create output path
+                    img_filename = os.path.basename(inp['file_name'])
+                    img_name = os.path.splitext(img_filename)[0]
+                    output_path = os.path.join(output_dir, f"{img_name}_logits.pt")
 
-            logger.info(f"\n{'=' * 60}")
-            logger.info("OUTPUT STRUCTURE:")
-            logger.info(f"Number of outputs: {len(outputs)}")
-            logger.info(f"Output type: {type(outputs)}")
-            logger.info(f"First output keys: {outputs[0].keys()}")
+                    # Save logits to disk
+                    torch.save({
+                        'logits': logits.cpu(),
+                        'file_name': inp['file_name'],
+                        'height': inp['height'],
+                        'width': inp['width'],
+                    }, output_path)
 
-            # Inspect each key in the output
-            for key, value in outputs[0].items():
-                logger.info(f"\n--- Key: '{key}' ---")
-                logger.info(f"  Type: {type(value)}")
-                if isinstance(value, torch.Tensor):
-                    logger.info(f"  Shape: {value.shape}")
-                    logger.info(f"  Dtype: {value.dtype}")
-                    logger.info(f"  Device: {value.device}")
-                    logger.info(f"  Min: {value.min().item():.4f}")
-                    logger.info(f"  Max: {value.max().item():.4f}")
-                    logger.info(f"  Mean: {value.mean().item():.4f}")
-                    logger.info(f"  Std: {value.std().item():.4f}")
-                else:
-                    logger.info(f"  Value: {value}")
+                    saved_count += 1
 
-            logger.info(f"\n{'=' * 60}")
-            logger.info("DONE - Check the output above and report back!")
-            logger.info(f"{'=' * 60}\n")
+                    # Print info for first sample
+                    if saved_count == 1:
+                        print(f"\n{'=' * 60}")
+                        print("FIRST SAMPLE INFO:")
+                        print(f"File: {inp['file_name']}")
+                        print(f"Image shape: {inp['image'].shape}")
+                        print(f"Logits shape: {logits.shape}")
+                        print(f"Logits dtype: {logits.dtype}")
+                        print(f"Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+                        print(f"Saved to: {output_path}")
+                        print(f"{'=' * 60}\n")
 
-            return {
-                "input_keys": list(inputs[0].keys()),
-                "output_keys": list(outputs[0].keys()),
-                "output": outputs[0],  # Return the actual output
-            }
+        print(f"\n{'=' * 60}")
+        print(f"DONE! Saved {saved_count} logit files to: {output_dir}")
+        print(f"{'=' * 60}\n")
+
+        return {"saved_count": saved_count, "output_dir": output_dir}
 
 
     @classmethod

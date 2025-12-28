@@ -61,7 +61,7 @@ from mask2former import (
 
 class Trainer(DefaultTrainer):
     """
-    Extension of the Trainer class adapted to MaskFormer.
+    Extension of fthe Trainer class adapted to MaskFormer.
     """
 
     @classmethod

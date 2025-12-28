@@ -11,7 +11,7 @@ MODEL:
     DROP_PATH_RATE: 0.3
     PATCH_NORM: True
     PRETRAIN_IMG_SIZE: 384
-  WEIGHTS: "swin_base_patch4_window12_384.pkl"
+  WEIGHTS: "/home/jovyan/mask2former/pretrained_weights/swin/swin_base_patch4_window7_224.pkl"
   PIXEL_MEAN: [123.675, 116.280, 103.530]
   PIXEL_STD: [58.395, 57.120, 57.375]
 INPUT:

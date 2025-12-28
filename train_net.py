@@ -63,6 +63,73 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+    
+    @classmethod
+    def inference_and_save_logits(cls, cfg, model, output_dir):
+        """
+        Run inference on ONE sample to inspect output structure.
+        """
+        import os
+        import torch
+        from detectron2.data import build_detection_test_loader
+
+        logger = logging.getLogger(__name__)
+        logger.info("Running inference on ONE sample to inspect output...")
+
+        os.makedirs(output_dir, exist_ok=True)
+        model.eval()
+
+        # Build dataloader for test dataset
+        dataset_name = cfg.DATASETS.TEST[0]
+        data_loader = build_detection_test_loader(cfg, dataset_name)
+
+        logger.info(f"Dataset: {dataset_name}")
+
+        with torch.no_grad():
+            # Get just the first batch
+            inputs = next(iter(data_loader))
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info("INPUT STRUCTURE:")
+            logger.info(f"Number of samples in batch: {len(inputs)}")
+            logger.info(f"First input keys: {inputs[0].keys()}")
+            logger.info(f"Image shape: {inputs[0]['image'].shape}")
+            logger.info(f"File name: {inputs[0]['file_name']}")
+
+            # Run inference
+            outputs = model(inputs)
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info("OUTPUT STRUCTURE:")
+            logger.info(f"Number of outputs: {len(outputs)}")
+            logger.info(f"Output type: {type(outputs)}")
+            logger.info(f"First output keys: {outputs[0].keys()}")
+
+            # Inspect each key in the output
+            for key, value in outputs[0].items():
+                logger.info(f"\n--- Key: '{key}' ---")
+                logger.info(f"  Type: {type(value)}")
+                if isinstance(value, torch.Tensor):
+                    logger.info(f"  Shape: {value.shape}")
+                    logger.info(f"  Dtype: {value.dtype}")
+                    logger.info(f"  Device: {value.device}")
+                    logger.info(f"  Min: {value.min().item():.4f}")
+                    logger.info(f"  Max: {value.max().item():.4f}")
+                    logger.info(f"  Mean: {value.mean().item():.4f}")
+                    logger.info(f"  Std: {value.std().item():.4f}")
+                else:
+                    logger.info(f"  Value: {value}")
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info("DONE - Check the output above and report back!")
+            logger.info(f"{'=' * 60}\n")
+
+            return {
+                "input_keys": list(inputs[0].keys()),
+                "output_keys": list(outputs[0].keys()),
+                "output": outputs[0],  # Return the actual output
+            }
+
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -309,6 +376,14 @@ def main(args):
         if comm.is_main_process():
             verify_results(cfg, res)
         return res
+    
+    if args.infer_only:
+        model = Trainer.build_model(cfg) 
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume) 
+        print("HERE")
+        output_dir = args.logits_output_dir if args.logits_output_dir else os.path.join(cfg.OUTPUT_DIR, "logits")
+        results = Trainer.inference_and_save_logits(cfg, model, output_dir)
+        return results
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
@@ -316,13 +391,12 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
-    print("Command Line Args:", args)
-    launch(
-        main,
-        args.num_gpus,
-        num_machines=args.num_machines,
-        machine_rank=args.machine_rank,
-        dist_url=args.dist_url,
-        args=(args,),
+    parser = default_argument_parser()
+    parser.add_argument("--infer-only", action="store_true", help="perform inference and save logits")
+    parser.add_argument("--logits-output-dir", type=str, default=None, help="directory to save logits")
+    args = parser.parse_args()
+    print("Command Line Args:", args) 
+    launch( 
+        main, args.num_gpus, num_machines=args.num_machines, machine_rank=args.machine_rank,
+        dist_url=args.dist_url, args=(args,), 
     )

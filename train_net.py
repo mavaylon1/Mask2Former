@@ -54,10 +54,29 @@ from mask2former import (
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
+    MaskFormerSemanticDatasetKDMapper,
     SemanticSegmentorWithTTA,
     add_maskformer2_config,
 )
+from tqdm import tqdm
+from detectron2.data import DatasetCatalog
 
+def register_ade20k_subset(n=50):
+    base = DatasetCatalog.get("ade20k_sem_seg_train")
+    return base[:n]
+
+DatasetCatalog.register(
+    "ade20k_sem_seg_train_subset",
+    lambda: register_ade20k_subset(50),
+)
+base_meta = MetadataCatalog.get("ade20k_sem_seg_train")
+
+MetadataCatalog.get("ade20k_sem_seg_train_subset").set(
+    evaluator_type="sem_seg",
+    ignore_label=base_meta.ignore_label,
+    stuff_classes=base_meta.stuff_classes,
+    stuff_colors=getattr(base_meta, "stuff_colors", None),
+)
 
 class Trainer(DefaultTrainer):
     """
@@ -65,100 +84,118 @@ class Trainer(DefaultTrainer):
     """
     
     @classmethod
-    def inference_and_save_logits(cls, cfg, model, output_dir):
+    def inference_and_save_semantic_probs(cls, cfg, model, output_path):
         """
-        Run inference on ONE sample and save logits to HDF5.
+        Run inference on TRAIN images and cache SEMANTIC PROBABILITIES
+        at native pixel-decoder resolution for knowledge distillation.
+
+        Output tensor per image:
+            semantic_probs: [C, H', W']
+            - non-negative
+            - sum_c == 1 per pixel
+            - query-invariant
+            - KD-ready
+
+        Assumptions:
+          - Teacher & student share class ordering
+          - Decoder resolution may vary per image
         """
         import os
         import torch
         import h5py
-        import numpy as np
+        from tqdm import tqdm
         from detectron2.data import build_detection_test_loader
+        from detectron2.structures import ImageList
 
-        print(f"Running inference and saving logits to: {output_dir}")
-
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         model.eval()
+        
+        dataset_name = "ade20k_sem_seg_train"
 
-        # Build dataloader for test dataset
-        dataset_name = cfg.DATASETS.TEST[0]
+        # dataset_name = "ade20k_sem_seg_train_subset"
         data_loader = build_detection_test_loader(cfg, dataset_name)
 
-        print(f"Dataset: {dataset_name}")
+        print(f"Inferencing on dataset: {dataset_name}")
+        print(f"Saving semantic probabilities to: {output_path}")
 
-        with torch.no_grad():
-            # Get just the first batch
-            inputs = next(iter(data_loader))
-            inp = inputs[0]
+        EPS = 1e-6
 
-            # Get raw logits by running model's backbone and head directly
-            # This bypasses semantic_inference which applies softmax/sigmoid
-            from detectron2.structures import ImageList
-            import torch.nn.functional as F
+        with h5py.File(output_path, "w") as h5f, torch.no_grad():
+            for inputs in tqdm(data_loader):
+                inp = inputs[0]
 
-            images = [x["image"].to(model.device) for x in inputs]
-            images = [(x - model.pixel_mean) / model.pixel_std for x in images]
-            images = ImageList.from_tensors(images, model.size_divisibility)
+                # -------------------------------------------------
+                # Image preprocessing (Detectron2 canonical)
+                # -------------------------------------------------
+                images = [x["image"].to(model.device) for x in inputs]
+                images = [(x - model.pixel_mean) / model.pixel_std for x in images]
+                images = ImageList.from_tensors(images, model.size_divisibility)
 
-            # Get features and raw outputs
-            features = model.backbone(images.tensor)
-            outputs = model.sem_seg_head(features)
+                # -------------------------------------------------
+                # Forward pass
+                # -------------------------------------------------
+                features = model.backbone(images.tensor)
+                outputs = model.sem_seg_head(features)
 
-            # Extract RAW logits (before softmax/sigmoid)
-            mask_cls_result = outputs["pred_logits"][0]  # Shape: [num_queries, num_classes+1]
-            mask_pred_result = outputs["pred_masks"][0]  # Shape: [num_queries, H, W]
+                # outputs are per-image; batch size = 1 here
+                mask_cls_logits  = outputs["pred_logits"][0]   # [Q, C+1]
+                mask_pred_logits = outputs["pred_masks"][0]    # [Q, H', W']
 
-            # Upsample masks to match image size
-            mask_pred_result = F.interpolate(
-                mask_pred_result.unsqueeze(0),
-                size=(images.tensor.shape[-2], images.tensor.shape[-1]),
-                mode="bilinear",
-                align_corners=False,
-            )[0]
+                # -------------------------------------------------
+                # Query → semantic aggregation (scores)
+                # -------------------------------------------------
+                cls_probs  = mask_cls_logits.softmax(dim=-1)[..., :-1]  # [Q, C]
+                mask_probs = mask_pred_logits.sigmoid()                 # [Q, H', W']
 
-            # Resize to original image dimensions
-            from detectron2.modeling.postprocessing import sem_seg_postprocess
-            height = inp.get("height", images.image_sizes[0][0])
-            width = inp.get("width", images.image_sizes[0][1])
-            mask_pred_result = sem_seg_postprocess(
-                mask_pred_result, images.image_sizes[0], height, width
-            )
-            mask_cls_result = mask_cls_result.to(mask_pred_result)
+                semantic_scores = torch.einsum(
+                    "qc,qhw->chw",
+                    cls_probs,
+                    mask_probs,
+                )                                                       # [C, H', W']
 
-            # Convert to numpy
-            mask_cls_logits = mask_cls_result.cpu().numpy()  # [num_queries, num_classes+1]
-            mask_pred_logits = mask_pred_result.cpu().numpy()  # [num_queries, H, W]
+                # -------------------------------------------------
+                # CRITICAL FIX: normalize per pixel over classes
+                # -------------------------------------------------
+                semantic_probs = semantic_scores / (
+                    semantic_scores.sum(dim=0, keepdim=True) + EPS
+                )                                                       # [C, H', W']
 
-            # Extract filename and create output path
-            img_filename = os.path.basename(inp['file_name'])
-            img_name = os.path.splitext(img_filename)[0]
-            output_path = os.path.join(output_dir, f"{img_name}_logits.h5")
+                # # -------------------------------------------------
+                # # Sanity checks (cheap + definitive)
+                # # -------------------------------------------------
+                # assert semantic_probs.min() >= 0.0
+                # assert torch.allclose(
+                #     semantic_probs.sum(dim=0),
+                #     torch.ones_like(semantic_probs[0]),
+                #     atol=1e-3,
+                # ), "Semantic probs do not sum to 1 per pixel"
 
-            # Save RAW logits to HDF5
-            with h5py.File(output_path, 'w') as f:
-                f.create_dataset('mask_cls_logits', data=mask_cls_logits, compression='gzip', compression_opts=4)
-                f.create_dataset('mask_pred_logits', data=mask_pred_logits, compression='gzip', compression_opts=4)
-                f.attrs['file_name'] = inp['file_name']
-                f.attrs['height'] = height
-                f.attrs['width'] = width
-                f.attrs['num_queries'] = mask_cls_logits.shape[0]
-                f.attrs['num_classes'] = mask_cls_logits.shape[1] - 1  # Exclude void class
+                # -------------------------------------------------
+                # Write to HDF5
+                # -------------------------------------------------
+                img_filename = os.path.basename(inp["file_name"])
+                img_name = os.path.splitext(img_filename)[0]
 
-            print(f"\n{'=' * 60}")
-            print("INFERENCE COMPLETE - RAW LOGITS SAVED:")
-            print(f"File: {inp['file_name']}")
-            print(f"Image shape: {inp['image'].shape}")
-            print(f"mask_cls_logits shape: {mask_cls_logits.shape}")
-            print(f"mask_pred_logits shape: {mask_pred_logits.shape}")
-            print(f"mask_cls_logits range: [{mask_cls_logits.min():.4f}, {mask_cls_logits.max():.4f}]")
-            print(f"mask_pred_logits range: [{mask_pred_logits.min():.4f}, {mask_pred_logits.max():.4f}]")
-            print(f"Saved to: {output_path}")
-            print(f"File size: {os.path.getsize(output_path) / (1024**2):.2f} MB")
-            print(f"\nNOTE: These are RAW logits (before softmax/sigmoid)")
-            print(f"Use these for distillation loss computation")
-            print(f"{'=' * 60}\n")
+                grp = h5f.create_group(img_name)
 
-            return {"output_path": output_path, "mask_cls_shape": mask_cls_logits.shape, "mask_pred_shape": mask_pred_logits.shape}
+                grp.create_dataset(
+                    "semantic_probs",
+                    data=semantic_probs.cpu().numpy(),
+                    compression="gzip",
+                    compression_opts=4,
+                )
+
+                # Metadata
+                C, H_dec, W_dec = semantic_probs.shape
+                grp.attrs["file_name"]   = inp["file_name"]
+                grp.attrs["num_classes"] = C
+                grp.attrs["height_dec"]  = H_dec
+                grp.attrs["width_dec"]   = W_dec
+                grp.attrs["normalized"]  = True
+                grp.attrs["note"]        = "Mask2Former semantic probs for KD"
+
+        print("Semantic-probability inference complete.")
+
 
 
     @classmethod
@@ -248,6 +285,9 @@ class Trainer(DefaultTrainer):
         # Semantic segmentation dataset mapper
         if cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_semantic":
             mapper = MaskFormerSemanticDatasetMapper(cfg, True)
+            return build_detection_train_loader(cfg, mapper=mapper)
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_kd_semantic":
+            mapper = MaskFormerSemanticDatasetKDMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper=mapper)
         # Panoptic segmentation dataset mapper
         elif cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_panoptic":
@@ -410,9 +450,13 @@ def main(args):
     if args.infer_only:
         model = Trainer.build_model(cfg) 
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume) 
-        print("HERE")
-        output_dir = args.logits_output_dir if args.logits_output_dir else os.path.join(cfg.OUTPUT_DIR, "logits")
-        results = Trainer.inference_and_save_logits(cfg, model, output_dir)
+        
+        logits_dir = args.logits_output_dir if args.logits_output_dir else os.path.join(cfg.OUTPUT_DIR, "logits")
+        os.makedirs(logits_dir, exist_ok=True)
+
+        output_path = os.path.join(logits_dir, "logits.h5")
+        results = Trainer.inference_and_save_semantic_probs(cfg, model, output_path)
+
         return results
 
     trainer = Trainer(cfg)
@@ -426,7 +470,15 @@ if __name__ == "__main__":
     parser.add_argument("--logits-output-dir", type=str, default=None, help="directory to save logits")
     args = parser.parse_args()
     print("Command Line Args:", args) 
-    launch( 
-        main, args.num_gpus, num_machines=args.num_machines, machine_rank=args.machine_rank,
-        dist_url=args.dist_url, args=(args,), 
-    )
+    if args.infer_only:
+        # run like a normal script (old behavior)
+        main(args)
+    else:
+        launch(
+            main,
+            args.num_gpus,
+            num_machines=args.num_machines,
+            machine_rank=args.machine_rank,
+            dist_url=args.dist_url,
+            args=(args,),
+        )

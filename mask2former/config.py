@@ -112,3 +112,8 @@ def add_maskformer2_config(cfg):
     # Importance sampling parameter for PointRend point sampling during training. Parametr `beta` in
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
+    
+    cfg.KD = CN()
+    cfg.KD.FILE = ""
+    cfg.KD.TEMP = 2.0
+    cfg.KD.WEIGHT = .01

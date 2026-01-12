@@ -190,14 +190,93 @@ class MaskFormer(nn.Module):
                     segments_info (list[dict]): Describe each segment in `panoptic_seg`.
                         Each dict contains keys "id", "category_id", "isthing".
         """
+        
         images = [x["image"].to(self.device) for x in batched_inputs]
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
         outputs = self.sem_seg_head(features)
+        
+        distillation = True if 'teacher_probs' in batched_inputs[0].keys() else False
 
-        if self.training:
+        if self.training and distillation:
+            # -------------------------------------------------
+            # 1. Build GT targets (REQUIRED)
+            # -------------------------------------------------
+            if "instances" in batched_inputs[0]:
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets = self.prepare_targets(gt_instances, images)
+            else:
+                raise ValueError("Distillation requires GT instances for Hungarian loss")
+
+            # -------------------------------------------------
+            # 2. Standard Mask2Former (Hungarian) loss
+            # -------------------------------------------------
+            losses = self.criterion(outputs, targets)
+
+            for k in list(losses.keys()):
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    losses.pop(k)
+
+            # ---------------------------------
+            # 3. Semantic KD loss (PER-IMAGE) — CORRECT
+            # ---------------------------------
+            eps = 1e-6
+            kd_losses = []
+
+            mask_cls_logits = outputs["pred_logits"]      # (B, Q, C+1)
+            mask_pred_logits = outputs["pred_masks"]      # (B, Q, H', W')
+
+            # --- Student semantic SCORES ---
+            cls_probs = F.softmax(mask_cls_logits, dim=-1)[..., :-1]  # (B, Q, C)
+            mask_probs = mask_pred_logits.sigmoid()                   # (B, Q, H', W')
+
+            student_scores = torch.einsum(
+                "bqc,bqhw->bchw",
+                cls_probs,
+                mask_probs,
+            )                                                         # (B, C, H', W')
+
+            for i, x in enumerate(batched_inputs):
+                # teacher semantic PROBS (already normalized offline)
+                teacher = x["teacher_probs"].to(self.device)          # (C, Ht, Wt)
+
+                student = student_scores[i]                           # (C, Hs, Ws)
+
+                # align spatial resolution
+                if teacher.shape[-2:] != student.shape[-2:]:
+                    teacher = F.interpolate(
+                        teacher.unsqueeze(0),
+                        size=student.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+
+                # normalize student per pixel (MANDATORY)
+                student = student / (student.sum(dim=0, keepdim=True) + eps)
+
+                # NOTE:
+                # - teacher is already normalized
+                # - no softmax
+                # - no temperature
+                # - no logits anywhere
+
+                kd_losses.append(
+                    F.kl_div(
+                        (teacher + eps).log(),   # input: log P_teacher
+                        student,                 # target: P_student
+                        reduction="batchmean",
+                    )
+                )
+
+            kd_loss = torch.stack(kd_losses).mean()
+            losses["loss_kd_semantic"] = batched_inputs[0]["kd_weight"] * kd_loss
+
+            return losses
+        elif self.training:
             # mask classification target
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]

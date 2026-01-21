@@ -14,6 +14,6 @@ MODEL:
   PIXEL_MEAN: [123.675, 116.280, 103.530]
   PIXEL_STD: [58.395, 57.120, 57.375]
 KD:
-  FILE: "/home/jovyan/mask2former/out_test/logits.h5"
+  FILE: "/home/jovyan/m2f-teacher-logits/logits.h5"
   TEMP: 2.0
   WEIGHT: .01
